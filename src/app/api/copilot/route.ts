@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@/shared/lib/supabase/server";
+import { createAdminClient } from "@/shared/lib/supabase/admin";
 
 // GRC Copilot System Prompt
 const SYSTEM_PROMPT = `You are the GRC Copilot for Aegis, an AI assistant that serves as the PRIMARY interface for a Governance, Risk, and Compliance platform. Users interact with you conversationally instead of navigating complex forms and menus.
@@ -363,7 +364,26 @@ export async function POST(request: NextRequest) {
       // Table may not exist yet
     }
 
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    // Use org's custom Anthropic API key if configured, otherwise use platform key
+    let anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+    if (organizationId) {
+      try {
+        const adminForKey = createAdminClient();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: orgData } = await (adminForKey as any)
+          .from("organizations")
+          .select("settings")
+          .eq("id", organizationId)
+          .single();
+        if (orgData?.settings?.anthropic_api_key) {
+          anthropicApiKey = orgData.settings.anthropic_api_key;
+        }
+      } catch {
+        // Fall back to platform key
+      }
+    }
+
+    const anthropic = new Anthropic({ apiKey: anthropicApiKey });
 
     const contextualPrompt = context
       ? `${SYSTEM_PROMPT}\n\n## Current Context\n- Page: ${context.page}`

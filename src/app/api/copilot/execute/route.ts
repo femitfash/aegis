@@ -2,6 +2,8 @@ import { NextRequest } from "next/server";
 import { createClient } from "@/shared/lib/supabase/server";
 import { createAdminClient } from "@/shared/lib/supabase/admin";
 
+const FREE_LIMIT = 10;
+
 export async function POST(request: NextRequest) {
   try {
     const { toolCallId, name, input } = await request.json();
@@ -57,6 +59,44 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // Fetch org settings for usage check and custom API key
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: orgData } = await (admin as any)
+      .from("organizations")
+      .select("settings")
+      .eq("id", organizationId)
+      .single();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const orgSettings: Record<string, any> = orgData?.settings || {};
+    const writeCount: number = orgSettings.copilot_write_count || 0;
+    const hasCustomKey = Boolean(orgSettings.anthropic_api_key);
+
+    // Enforce free tier limit unless org has their own API key
+    if (writeCount >= FREE_LIMIT && !hasCustomKey) {
+      return Response.json(
+        {
+          error: "free_limit_reached",
+          message: `You've used all ${FREE_LIMIT} free AI actions. Add your Anthropic API key in Settings → AI Copilot to unlock unlimited usage.`,
+          write_count: writeCount,
+          limit: FREE_LIMIT,
+        },
+        { status: 402 }
+      );
+    }
+
+    // Helper: increment write count in settings (only when using platform key)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async function bumpCount(mergedSettings?: Record<string, any>) {
+      if (hasCustomKey) return; // unlimited with custom key
+      const base = mergedSettings ?? orgSettings;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (admin as any)
+        .from("organizations")
+        .update({ settings: { ...base, copilot_write_count: writeCount + 1 } })
+        .eq("id", organizationId);
+    }
+
     switch (name) {
       case "create_risk": {
         const likelihood = Number(input.inherent_likelihood) || 3;
@@ -89,6 +129,7 @@ export async function POST(request: NextRequest) {
           );
         }
 
+        await bumpCount();
         return Response.json({ success: true, result: data, toolCallId });
       }
 
@@ -123,26 +164,19 @@ export async function POST(request: NextRequest) {
           );
         }
 
+        await bumpCount();
         return Response.json({ success: true, result: data, toolCallId });
       }
 
       case "update_requirement_status": {
-        // Store per-org requirement status overrides in organizations.settings
         const key = `${input.framework_code}::${input.requirement_code}`;
         const newStatus = input.status as string;
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: orgData } = await (admin as any)
-          .from("organizations")
-          .select("settings")
-          .eq("id", organizationId)
-          .single();
-
-        const currentSettings = orgData?.settings || {};
-        const currentStatuses = currentSettings.requirement_statuses || {};
+        const currentStatuses = orgSettings.requirement_statuses || {};
         const newSettings = {
-          ...currentSettings,
+          ...orgSettings,
           requirement_statuses: { ...currentStatuses, [key]: newStatus },
+          // Fold counter increment into this update to avoid two writes
+          copilot_write_count: hasCustomKey ? writeCount : writeCount + 1,
         };
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -162,22 +196,13 @@ export async function POST(request: NextRequest) {
       }
 
       case "create_requirement": {
-        // Add a requirement to a custom framework stored in organizations.settings
         const frameworkCode = String(input.framework_code || "").toUpperCase().replace(/[^A-Z0-9_]/g, "_");
         const domainName = String(input.domain || "General").trim();
         const reqCode =
           String(input.code || "").trim() ||
           `REQ-${Date.now().toString(36).toUpperCase()}`;
 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: orgDataReq } = await (admin as any)
-          .from("organizations")
-          .select("settings")
-          .eq("id", organizationId)
-          .single();
-
-        const currentSettingsReq = orgDataReq?.settings || {};
-        const customReqs = currentSettingsReq.custom_framework_requirements || {};
+        const customReqs = orgSettings.custom_framework_requirements || {};
         const fwReqs = customReqs[frameworkCode] || {};
         const domainReqs: object[] = fwReqs[domainName] || [];
 
@@ -191,21 +216,20 @@ export async function POST(request: NextRequest) {
           evidenceRequired: Number(input.evidence_required) || 1,
         };
 
-        const updatedSettingsReq = {
-          ...currentSettingsReq,
+        // Fold counter increment into this update to avoid two writes
+        const updatedSettings = {
+          ...orgSettings,
           custom_framework_requirements: {
             ...customReqs,
-            [frameworkCode]: {
-              ...fwReqs,
-              [domainName]: [...domainReqs, newReq],
-            },
+            [frameworkCode]: { ...fwReqs, [domainName]: [...domainReqs, newReq] },
           },
+          copilot_write_count: hasCustomKey ? writeCount : writeCount + 1,
         };
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const { error: reqError } = await (admin as any)
           .from("organizations")
-          .update({ settings: updatedSettingsReq })
+          .update({ settings: updatedSettings })
           .eq("id", organizationId);
 
         if (reqError) {
@@ -243,6 +267,7 @@ export async function POST(request: NextRequest) {
           );
         }
 
+        await bumpCount();
         return Response.json({ success: true, result: data, toolCallId });
       }
 

@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useTheme } from "@/shared/hooks/useTheme";
 
-type Tab = "organization" | "team" | "integrations" | "notifications" | "security" | "appearance";
+type Tab = "organization" | "team" | "integrations" | "notifications" | "security" | "appearance" | "ai";
 
 const TEAM_MEMBERS = [
   { id: "1", name: "Alice Chen", email: "alice@example.com", role: "Compliance Manager", status: "active", lastActive: "2 hours ago", avatar: "AC" },
@@ -33,6 +33,44 @@ export default function SettingsPage() {
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState("Viewer");
 
+  // AI Copilot settings
+  const [aiUsage, setAiUsage] = useState<{ write_count: number; has_custom_key: boolean; limit: number } | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeySaved, setApiKeySaved] = useState(false);
+  const [apiKeyError, setApiKeyError] = useState("");
+  const [apiKeyLoading, setApiKeyLoading] = useState(false);
+
+  useEffect(() => {
+    if (activeTab === "ai") {
+      fetch("/api/settings/copilot")
+        .then((r) => r.json())
+        .then(setAiUsage)
+        .catch(() => {});
+    }
+  }, [activeTab]);
+
+  const handleSaveApiKey = async () => {
+    setApiKeyLoading(true);
+    setApiKeyError("");
+    try {
+      const res = await fetch("/api/settings/copilot", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: apiKey }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed");
+      setAiUsage((prev) => prev ? { ...prev, has_custom_key: data.has_custom_key } : null);
+      setApiKey("");
+      setApiKeySaved(true);
+      setTimeout(() => setApiKeySaved(false), 3000);
+    } catch (err) {
+      setApiKeyError(err instanceof Error ? err.message : "Failed to save");
+    } finally {
+      setApiKeyLoading(false);
+    }
+  };
+
   const handleSave = () => {
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
@@ -45,6 +83,7 @@ export default function SettingsPage() {
     { id: "notifications", label: "Notifications", icon: "🔔" },
     { id: "security", label: "Security", icon: "🔒" },
     { id: "appearance", label: "Appearance", icon: "🎨" },
+    { id: "ai", label: "AI Copilot", icon: "🤖" },
   ];
 
   return (
@@ -370,6 +409,121 @@ export default function SettingsPage() {
               </div>
             </div>
           )}
+          {activeTab === "ai" && (
+            <div className="space-y-6">
+              {/* Usage meter */}
+              <div className="p-6 rounded-lg border bg-card">
+                <h2 className="font-semibold mb-1">Free Usage</h2>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Each approved copilot action (create risk, control, framework, or requirement) counts toward your free allowance.
+                </p>
+                {aiUsage ? (
+                  <>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-sm font-medium">
+                        {aiUsage.has_custom_key ? (
+                          <span className="text-green-600">✅ Unlimited — using your API key</span>
+                        ) : (
+                          <span>
+                            <strong>{aiUsage.write_count}</strong> / {aiUsage.limit} free actions used
+                          </span>
+                        )}
+                      </span>
+                      {!aiUsage.has_custom_key && (
+                        <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${
+                          aiUsage.write_count >= aiUsage.limit
+                            ? "bg-red-100 text-red-700"
+                            : aiUsage.write_count >= aiUsage.limit * 0.7
+                            ? "bg-yellow-100 text-yellow-700"
+                            : "bg-green-100 text-green-700"
+                        }`}>
+                          {aiUsage.write_count >= aiUsage.limit ? "Limit reached" :
+                            `${aiUsage.limit - aiUsage.write_count} remaining`}
+                        </span>
+                      )}
+                    </div>
+                    {!aiUsage.has_custom_key && (
+                      <div className="w-full bg-muted rounded-full h-2">
+                        <div
+                          className={`h-2 rounded-full transition-all ${
+                            aiUsage.write_count >= aiUsage.limit ? "bg-red-500" :
+                            aiUsage.write_count >= aiUsage.limit * 0.7 ? "bg-yellow-500" : "bg-green-500"
+                          }`}
+                          style={{ width: `${Math.min((aiUsage.write_count / aiUsage.limit) * 100, 100)}%` }}
+                        />
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="h-4 bg-muted rounded animate-pulse w-48" />
+                )}
+              </div>
+
+              {/* API Key */}
+              <div className="p-6 rounded-lg border bg-card">
+                <h2 className="font-semibold mb-1">Your Anthropic API Key</h2>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Add your own key from{" "}
+                  <a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer" className="text-primary underline">
+                    console.anthropic.com
+                  </a>{" "}
+                  to unlock unlimited AI actions. Your key is stored securely and never shared.
+                </p>
+
+                {aiUsage?.has_custom_key && (
+                  <div className="flex items-center gap-2 mb-4 p-3 rounded-md bg-green-50 border border-green-200">
+                    <span className="text-green-600 text-sm font-medium">✅ Custom API key is configured — unlimited usage enabled</span>
+                  </div>
+                )}
+
+                {apiKeyError && (
+                  <p className="text-sm text-red-600 mb-3 p-2 bg-red-50 rounded">{apiKeyError}</p>
+                )}
+
+                <div className="flex gap-2 max-w-lg">
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder={aiUsage?.has_custom_key ? "Enter new key to replace existing" : "sk-ant-..."}
+                    className="flex-1 px-3 py-2 rounded-md border bg-background text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary"
+                  />
+                  <button
+                    onClick={handleSaveApiKey}
+                    disabled={apiKeyLoading || !apiKey.trim()}
+                    className={`px-4 py-2 rounded-md text-sm font-medium transition-colors disabled:opacity-50 ${
+                      apiKeySaved
+                        ? "bg-green-600 text-white"
+                        : "bg-primary text-primary-foreground hover:bg-primary/90"
+                    }`}
+                  >
+                    {apiKeySaved ? "✅ Saved!" : apiKeyLoading ? "Saving..." : "Save Key"}
+                  </button>
+                  {aiUsage?.has_custom_key && (
+                    <button
+                      disabled={apiKeyLoading}
+                      className="px-4 py-2 rounded-md text-sm border text-red-600 border-red-200 hover:bg-red-50 transition-colors disabled:opacity-50"
+                      title="Remove API key (revert to free tier)"
+                      onClick={() => {
+                        setApiKey("");
+                        fetch("/api/settings/copilot", {
+                          method: "PATCH",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ api_key: "" }),
+                        }).then(() => setAiUsage((p) => p ? { ...p, has_custom_key: false } : null));
+                      }}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground mt-3">
+                  Your key is only used for requests from your organization and is not logged.
+                </p>
+              </div>
+            </div>
+          )}
+
           {activeTab === "appearance" && (
             <div className="space-y-6">
               <div className="p-6 rounded-lg border bg-card">

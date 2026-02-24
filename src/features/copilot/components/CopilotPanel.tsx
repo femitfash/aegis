@@ -77,6 +77,26 @@ export function CopilotPanel({ onClose, context }: CopilotPanelProps) {
       });
       const data = await res.json();
 
+      if (res.status === 402) {
+        // Free tier limit reached — show upgrade prompt
+        const limitMsg: Message = {
+          id: generateId(),
+          role: "assistant",
+          content: `🔒 **Free tier limit reached**\n\nYou've used all 10 free AI actions. To continue:\n1. Go to **Settings → AI Copilot**\n2. Add your Anthropic API key from [console.anthropic.com](https://console.anthropic.com)\n3. Unlock unlimited usage`,
+          timestamp: new Date(),
+        };
+        setMessages((prev) =>
+          prev.map((m) => ({
+            ...m,
+            actions: m.actions?.map((a) =>
+              a.id === action.id ? { ...a, status: "rejected" as const } : a
+            ),
+          }))
+        );
+        setMessages((prev) => [...prev, limitMsg]);
+        return;
+      }
+
       if (!res.ok) {
         throw new Error(data.detail || data.error || `Server error ${res.status}`);
       }
