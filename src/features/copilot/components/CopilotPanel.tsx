@@ -1,0 +1,755 @@
+"use client";
+
+import { useState, useRef, useEffect, useCallback } from "react";
+
+interface Message {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp: Date;
+  actions?: CopilotAction[];
+  isStreaming?: boolean;
+}
+
+interface CopilotAction {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+  status: "pending" | "executing" | "executed" | "rejected";
+  result?: Record<string, unknown>;
+}
+
+interface CopilotPanelProps {
+  onClose: () => void;
+  context?: { page: string; entityType?: string };
+}
+
+// Generate a stable conversation ID per session
+function generateId(): string {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+const CONVERSATION_ID = generateId();
+
+export function CopilotPanel({ onClose, context }: CopilotPanelProps) {
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: "welcome",
+      role: "assistant",
+      content:
+        "Hi! I'm your GRC Copilot. I can help you **register risks**, map controls, track evidence, and check your compliance posture — just describe what you need.\n\nTry asking:\n- \"Register a risk about our S3 buckets being public\"\n- \"What's our SOC 2 readiness?\"\n- \"Find controls for access management\"",
+      timestamp: new Date(),
+    },
+  ]);
+  const [input, setInput] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  const executeAction = useCallback(async (action: CopilotAction, msgId: string) => {
+    // Mark as executing
+    setMessages((prev) =>
+      prev.map((m) => ({
+        ...m,
+        actions: m.actions?.map((a) =>
+          a.id === action.id ? { ...a, status: "executing" as const } : a
+        ),
+      }))
+    );
+
+    try {
+      const res = await fetch("/api/copilot/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          toolCallId: action.id,
+          name: action.name,
+          input: action.input,
+        }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.detail || data.error || `Server error ${res.status}`);
+      }
+
+      setMessages((prev) =>
+        prev.map((m) => ({
+          ...m,
+          actions: m.actions?.map((a) =>
+            a.id === action.id
+              ? { ...a, status: "executed" as const, result: data.result }
+              : a
+          ),
+        }))
+      );
+
+      // Notify other parts of the app that data changed
+      if (action.name === "create_risk") {
+        window.dispatchEvent(new CustomEvent("grc:risk-created"));
+      } else if (action.name === "create_control") {
+        window.dispatchEvent(new CustomEvent("grc:control-created"));
+      } else if (action.name === "create_framework") {
+        window.dispatchEvent(new CustomEvent("grc:framework-created"));
+      } else if (action.name === "update_requirement_status") {
+        window.dispatchEvent(new CustomEvent("grc:requirement-status-updated"));
+      } else if (action.name === "create_requirement") {
+        window.dispatchEvent(new CustomEvent("grc:requirement-created"));
+      }
+
+      // Add a follow-up message
+      const entityName =
+        action.name === "create_risk" ? "risk" :
+        action.name === "create_control" ? "control" :
+        action.name === "update_requirement_status" ? "requirement status" :
+        action.name === "create_requirement" ? "requirement" :
+        action.name.replace(/_/g, " ");
+      const successMsg: Message = {
+        id: generateId(),
+        role: "assistant",
+        content: `✅ Done! The ${entityName} has been saved to your register. The list will update automatically.`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, successMsg]);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "Unknown error";
+      setMessages((prev) =>
+        prev.map((m) => ({
+          ...m,
+          actions: m.actions?.map((a) =>
+            a.id === action.id ? { ...a, status: "rejected" as const } : a
+          ),
+        }))
+      );
+      // Show error to user
+      const failMsg: Message = {
+        id: generateId(),
+        role: "assistant",
+        content: `❌ Failed to save: ${errMsg}. Please try again.`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, failMsg]);
+    }
+    void msgId;
+  }, []);
+
+  const rejectAction = useCallback((actionId: string) => {
+    setMessages((prev) =>
+      prev.map((m) => ({
+        ...m,
+        actions: m.actions?.map((a) =>
+          a.id === actionId ? { ...a, status: "rejected" as const } : a
+        ),
+      }))
+    );
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isLoading) return;
+
+    const userMessage: Message = {
+      id: generateId(),
+      role: "user",
+      content: input,
+      timestamp: new Date(),
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    const sentInput = input;
+    setInput("");
+    setIsLoading(true);
+
+    // Create a placeholder assistant message for streaming
+    const assistantMsgId = generateId();
+    const assistantMessage: Message = {
+      id: assistantMsgId,
+      role: "assistant",
+      content: "",
+      timestamp: new Date(),
+      isStreaming: true,
+    };
+    setMessages((prev) => [...prev, assistantMessage]);
+
+    try {
+      // Build history from completed messages (exclude welcome, exclude current placeholder)
+      const history = messages
+        .filter((m) => m.id !== "welcome" && !m.isStreaming && m.content.trim())
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      const response = await fetch("/api/copilot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: sentInput,
+          conversationId: CONVERSATION_ID,
+          context,
+          history,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let fullText = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.type === "text") {
+              fullText += data.text;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsgId
+                    ? { ...m, content: fullText, isStreaming: true }
+                    : m
+                )
+              );
+            } else if (data.type === "done") {
+              // Finalize message with pending actions
+              const actions: CopilotAction[] = (data.pendingActions || []).map(
+                (pa: { id: string; name: string; input: Record<string, unknown> }) => ({
+                  id: pa.id,
+                  name: pa.name,
+                  input: pa.input,
+                  status: "pending" as const,
+                })
+              );
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsgId
+                    ? { ...m, isStreaming: false, actions: actions.length > 0 ? actions : undefined }
+                    : m
+                )
+              );
+            }
+          } catch {
+            // Ignore malformed SSE lines
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Copilot error:", error);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsgId
+            ? {
+                ...m,
+                content: "Sorry, I encountered an error. Please try again.",
+                isStreaming: false,
+              }
+            : m
+        )
+      );
+    } finally {
+      setIsLoading(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit(e as unknown as React.FormEvent);
+    }
+  };
+
+  return (
+    <div className="w-96 border-l bg-card flex flex-col h-screen">
+      {/* Header */}
+      <div className="p-4 border-b flex items-center justify-between bg-primary/5">
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-sm font-bold">
+            AI
+          </div>
+          <div>
+            <span className="font-semibold text-sm">GRC Copilot</span>
+            <div className="flex items-center gap-1">
+              <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
+              <span className="text-xs text-muted-foreground">Online</span>
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={onClose}
+          className="p-1.5 rounded hover:bg-accent transition-colors text-muted-foreground hover:text-foreground"
+          aria-label="Close copilot"
+        >
+          ✕
+        </button>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-auto p-4 space-y-4">
+        {messages.map((message) => (
+          <div key={message.id}>
+            <div
+              className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+            >
+              <div
+                className={`max-w-[88%] rounded-2xl px-4 py-3 ${
+                  message.role === "user"
+                    ? "bg-primary text-primary-foreground rounded-br-sm"
+                    : "bg-muted rounded-bl-sm"
+                }`}
+              >
+                <MarkdownText
+                  text={message.content}
+                  isUser={message.role === "user"}
+                  isStreaming={message.isStreaming}
+                />
+              </div>
+            </div>
+
+            {/* Action Cards */}
+            {message.actions?.map((action) => (
+              <ActionCard
+                key={action.id}
+                action={action}
+                onApprove={() => executeAction(action, message.id)}
+                onReject={() => rejectAction(action.id)}
+              />
+            ))}
+          </div>
+        ))}
+
+        {isLoading && messages[messages.length - 1]?.content === "" && (
+          <div className="flex justify-start">
+            <div className="bg-muted rounded-2xl rounded-bl-sm px-4 py-3">
+              <div className="flex gap-1 items-center">
+                <div className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-bounce" style={{ animationDelay: "0ms" }} />
+                <div className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-bounce" style={{ animationDelay: "150ms" }} />
+                <div className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-bounce" style={{ animationDelay: "300ms" }} />
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input */}
+      <div className="p-4 border-t">
+        <form onSubmit={handleSubmit} className="flex gap-2">
+          <input
+            ref={inputRef}
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Ask anything about GRC..."
+            className="flex-1 px-4 py-2.5 rounded-xl border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50"
+            disabled={isLoading}
+          />
+          <button
+            type="submit"
+            disabled={isLoading || !input.trim()}
+            className="px-4 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium disabled:opacity-50 transition-colors hover:bg-primary/90"
+          >
+            ↑
+          </button>
+        </form>
+        <p className="text-xs text-muted-foreground mt-2 text-center">
+          Powered by Claude · Aegis GRC
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// Simple markdown renderer for copilot messages
+function MarkdownText({
+  text,
+  isUser,
+  isStreaming,
+}: {
+  text: string;
+  isUser: boolean;
+  isStreaming?: boolean;
+}) {
+  if (!text && isStreaming) {
+    return (
+      <div className="flex gap-1 items-center py-1">
+        <div className="w-1.5 h-1.5 rounded-full bg-current opacity-40 animate-bounce" style={{ animationDelay: "0ms" }} />
+        <div className="w-1.5 h-1.5 rounded-full bg-current opacity-40 animate-bounce" style={{ animationDelay: "150ms" }} />
+        <div className="w-1.5 h-1.5 rounded-full bg-current opacity-40 animate-bounce" style={{ animationDelay: "300ms" }} />
+      </div>
+    );
+  }
+
+  // Process markdown-like formatting
+  const lines = text.split("\n");
+  const elements: React.ReactNode[] = [];
+
+  lines.forEach((line, i) => {
+    if (line.startsWith("### ")) {
+      elements.push(
+        <p key={i} className="font-semibold text-sm mt-1">
+          {renderInline(line.slice(4), isUser)}
+        </p>
+      );
+    } else if (line.startsWith("## ")) {
+      elements.push(
+        <p key={i} className="font-bold text-sm mt-1">
+          {renderInline(line.slice(3), isUser)}
+        </p>
+      );
+    } else if (line.startsWith("- ") || line.startsWith("* ")) {
+      elements.push(
+        <div key={i} className="flex gap-2 text-sm">
+          <span className="opacity-60 mt-0.5">•</span>
+          <span>{renderInline(line.slice(2), isUser)}</span>
+        </div>
+      );
+    } else if (/^\d+\. /.test(line)) {
+      const match = line.match(/^(\d+)\. (.+)/);
+      if (match) {
+        elements.push(
+          <div key={i} className="flex gap-2 text-sm">
+            <span className="opacity-60 font-medium min-w-[16px]">{match[1]}.</span>
+            <span>{renderInline(match[2], isUser)}</span>
+          </div>
+        );
+      }
+    } else if (line === "") {
+      elements.push(<div key={i} className="h-1" />);
+    } else {
+      elements.push(
+        <p key={i} className="text-sm leading-relaxed">
+          {renderInline(line, isUser)}
+        </p>
+      );
+    }
+  });
+
+  return (
+    <div className="space-y-0.5">
+      {elements}
+      {isStreaming && <span className="inline-block w-0.5 h-3.5 bg-current opacity-70 animate-pulse ml-0.5 align-middle" />}
+    </div>
+  );
+}
+
+function renderInline(text: string, isUser: boolean): React.ReactNode {
+  // Handle **bold**, `code`, and [links](url)
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return <strong key={i}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return (
+        <code
+          key={i}
+          className={`px-1 py-0.5 rounded text-xs font-mono ${
+            isUser ? "bg-white/20" : "bg-background border"
+          }`}
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    const linkMatch = part.match(/\[([^\]]+)\]\(([^)]+)\)/);
+    if (linkMatch) {
+      return (
+        <a
+          key={i}
+          href={linkMatch[2]}
+          className="underline opacity-80 hover:opacity-100"
+        >
+          {linkMatch[1]}
+        </a>
+      );
+    }
+    return part;
+  });
+}
+
+function ActionCard({
+  action,
+  onApprove,
+  onReject,
+}: {
+  action: CopilotAction;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const entityLabels: Record<string, string> = {
+    create_risk: "Create Risk",
+    update_risk: "Update Risk",
+    delete_risk: "Delete Risk",
+    create_control: "Create Control",
+    create_framework: "Create Framework",
+    update_requirement_status: "Update Requirement",
+    create_requirement: "Add Requirement",
+  };
+
+  if (action.status === "executing") {
+    return (
+      <div className="mt-2 ml-2 p-3 rounded-xl border bg-muted/50">
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+          <p className="text-xs text-muted-foreground">Executing...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (action.status !== "pending") {
+    return (
+      <div className="mt-2 ml-2 p-3 rounded-xl border bg-muted/30">
+        <p className="text-xs text-muted-foreground">
+          {action.status === "executed" ? "✅ Action executed successfully" : "❌ Action rejected"}
+        </p>
+      </div>
+    );
+  }
+
+  const input = action.input;
+  const score =
+    typeof input.inherent_likelihood === "number" &&
+    typeof input.inherent_impact === "number"
+      ? input.inherent_likelihood * input.inherent_impact
+      : null;
+
+  // Determine which fields to show based on action type
+  const isRisk = action.name === "create_risk";
+  const isControl = action.name === "create_control";
+  const isFramework = action.name === "create_framework";
+  const isRequirementUpdate = action.name === "update_requirement_status";
+  const isRequirementCreate = action.name === "create_requirement";
+
+  return (
+    <div className="mt-2 ml-2 p-4 rounded-xl border bg-card shadow-sm">
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-xs font-semibold uppercase tracking-wide text-primary bg-primary/10 px-2 py-0.5 rounded">
+          {entityLabels[action.name] || action.name}
+        </span>
+        <span className="text-xs text-muted-foreground">Pending approval</span>
+      </div>
+
+      <div className="space-y-1.5 mb-3">
+        {/* Risk fields */}
+        {isRisk && (
+          <>
+            {Boolean(input.title) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Title:</span>
+                <span className="font-medium">{String(input.title)}</span>
+              </div>
+            )}
+            {Boolean(input.category) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Category:</span>
+                <span className="capitalize">{String(input.category)}</span>
+              </div>
+            )}
+            {Boolean(input.inherent_likelihood) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Likelihood:</span>
+                <span>{String(input.inherent_likelihood)}/5</span>
+              </div>
+            )}
+            {Boolean(input.inherent_impact) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Impact:</span>
+                <span>{String(input.inherent_impact)}/5</span>
+              </div>
+            )}
+            {score !== null && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Risk Score:</span>
+                <span
+                  className={`font-bold ${
+                    score >= 20
+                      ? "text-red-600"
+                      : score >= 15
+                      ? "text-orange-600"
+                      : score >= 10
+                      ? "text-yellow-600"
+                      : "text-green-600"
+                  }`}
+                >
+                  {score}/25
+                </span>
+              </div>
+            )}
+            {Boolean(input.risk_response) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Response:</span>
+                <span className="capitalize">{String(input.risk_response)}</span>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Control fields */}
+        {isControl && (
+          <>
+            {Boolean(input.code) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Code:</span>
+                <span className="font-mono font-semibold">{String(input.code)}</span>
+              </div>
+            )}
+            {Boolean(input.title) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Title:</span>
+                <span className="font-medium">{String(input.title)}</span>
+              </div>
+            )}
+            {Boolean(input.control_type) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Type:</span>
+                <span className="capitalize">{String(input.control_type)}</span>
+              </div>
+            )}
+            {Boolean(input.automation_level) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Automation:</span>
+                <span className="capitalize">{String(input.automation_level).replace("-", " ")}</span>
+              </div>
+            )}
+            {Boolean(input.effectiveness_rating) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Effectiveness:</span>
+                <span>{String(input.effectiveness_rating)}/5</span>
+              </div>
+            )}
+            {Array.isArray(input.frameworks) && (input.frameworks as string[]).length > 0 && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Frameworks:</span>
+                <span>{(input.frameworks as string[]).join(", ")}</span>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Requirement status update fields */}
+        {isRequirementUpdate && (
+          <>
+            {Boolean(input.framework_code) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Framework:</span>
+                <span className="font-mono font-semibold">{String(input.framework_code)}</span>
+              </div>
+            )}
+            {Boolean(input.requirement_code) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Requirement:</span>
+                <span className="font-mono">{String(input.requirement_code)}</span>
+              </div>
+            )}
+            {Boolean(input.status) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">New Status:</span>
+                <span className="capitalize font-medium">{String(input.status).replace("-", " ")}</span>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Requirement creation fields */}
+        {isRequirementCreate && (
+          <>
+            {Boolean(input.framework_code) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Framework:</span>
+                <span className="font-mono font-semibold">{String(input.framework_code)}</span>
+              </div>
+            )}
+            {Boolean(input.domain) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Domain:</span>
+                <span>{String(input.domain)}</span>
+              </div>
+            )}
+            {Boolean(input.code) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Code:</span>
+                <span className="font-mono">{String(input.code)}</span>
+              </div>
+            )}
+            {Boolean(input.title) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Title:</span>
+                <span className="font-medium">{String(input.title)}</span>
+              </div>
+            )}
+            {Boolean(input.evidence_required) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Evidence:</span>
+                <span>{String(input.evidence_required)} item{Number(input.evidence_required) !== 1 ? "s" : ""} required</span>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Framework fields */}
+        {isFramework && (
+          <>
+            {Boolean(input.code) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Code:</span>
+                <span className="font-mono font-semibold">{String(input.code)}</span>
+              </div>
+            )}
+            {Boolean(input.name) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Name:</span>
+                <span className="font-medium">{String(input.name)}</span>
+              </div>
+            )}
+            {Boolean(input.version) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Version:</span>
+                <span>{String(input.version)}</span>
+              </div>
+            )}
+            {Boolean(input.description) && (
+              <div className="flex text-sm">
+                <span className="text-muted-foreground w-24 shrink-0">Description:</span>
+                <span className="text-xs">{String(input.description)}</span>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="flex gap-2">
+        <button
+          onClick={onApprove}
+          className="flex-1 px-3 py-2 rounded-lg text-sm font-medium bg-green-600 text-white hover:bg-green-700 transition-colors"
+        >
+          {isRequirementCreate ? "Add Requirement" : "Approve & Create"}
+        </button>
+        <button
+          onClick={onReject}
+          className="flex-1 px-3 py-2 rounded-lg text-sm border hover:bg-accent transition-colors"
+        >
+          Reject
+        </button>
+      </div>
+    </div>
+  );
+}
